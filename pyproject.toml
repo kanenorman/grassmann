@@ -1,0 +1,13 @@
+[project]
+name = "grassmann"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "datasets>=3.2.0",
+    "einops>=0.8.2",
+    "pydantic>=2.12.5",
+    "torch>=2.10.0",
+    "transformers>=4.48.3",
+]
