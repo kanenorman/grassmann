@@ -10,3 +10,10 @@ wheels/
 .venv
 
 training_results/*
+
+# IDEs
+.idea/*
+.vscode/*
+
+#Mac
+.DStore

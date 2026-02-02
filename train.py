@@ -1,6 +1,6 @@
 import argparse
 import json
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -23,10 +23,14 @@ class ExperimentConfig:
     d_model: int
     max_context_len: int
     batch_size: int
+    tensor_lifting_strategy: str
     num_heads: int
     dropout_rate: float
     num_epochs: int
     learning_rate: float
+    d_low: int
+    lags: list
+    pre_norm: bool = False
 
 
 def load_data(max_context_len, batch_size):
@@ -47,13 +51,19 @@ def create_model(vocab_size, config, device):
     lm_config = LMConfig(
         vocab_size=vocab_size,
         max_context_len=config.max_context_len,
+        num_layers=config.num_layers,
+        tensor_lifting_strategy=config.tensor_lifting_strategy,
+        lags=config.lags,
         d_model=config.d_model,
         num_heads=config.num_heads,
-        num_layers=config.num_layers,
+        expansion_ratio=4,
         dropout_rate=config.dropout_rate,
+        weight_tying=True,
+        d_low=config.d_low,
+        pre_norm=config.pre_norm,
     )
     model = Transformer(lm_config).to(device)
-    return model
+    return model, lm_config
 
 
 def count_parameters(model):
@@ -112,24 +122,29 @@ def train_model(config, device=None):
         else:
             device = "cpu"
 
-    print(f"\n{'=' * 80}")
-    print(f"Experiment: {config.name}")
-    print(f"{'=' * 80}")
+    width = 80
+    print(f"{'=' * width}\nExperiment: {config.name}\n{'=' * width}")
 
     train_loader, val_loader, vocab_size = load_data(
         config.max_context_len, config.batch_size
     )
 
-    model = create_model(vocab_size, config, device)
+    model, lm_config = create_model(vocab_size, config, device)
     optimizer = AdamW(model.parameters(), lr=config.learning_rate)
     scheduler = CosineAnnealingLR(optimizer, T_max=config.num_epochs)
     criterion = nn.CrossEntropyLoss()
 
     num_params = count_parameters(model)
-    print(f"Model: {config.num_layers} layers, {config.d_model} d_model")
-    print(f"Sequence length: {config.max_context_len}, Batch size: {config.batch_size}")
-    print(f"Parameters: {num_params / 1e6:.2f}M")
-    print(f"Device: {device}")
+    print(
+        f"{' CONFIGURATION ':=^{width}}\n"
+        f"{'Layers:':<18} {config.num_layers}\n"
+        f"{'D_Model:':<18} {config.d_model}\n"
+        f"{'Sequence Len:':<18} {config.max_context_len}\n"
+        f"{'Batch Size:':<18} {config.batch_size}\n"
+        f"{'Parameters:':<18} {num_params / 1e6:.2f}M\n"
+        f"{'Device:':<18} {device}\n"
+        f"{'=' * width}"
+    )
 
     train_losses = []
     val_losses = []
@@ -159,17 +174,8 @@ def train_model(config, device=None):
 
     return {
         "experiment_name": config.name,
-        "config": {
-            "num_layers": config.num_layers,
-            "d_model": config.d_model,
-            "max_context_len": config.max_context_len,
-            "num_heads": config.num_heads,
-            "dropout_rate": config.dropout_rate,
-            "batch_size": config.batch_size,
-            "num_epochs": config.num_epochs,
-            "learning_rate": config.learning_rate,
-            "vocab_size": vocab_size,
-        },
+        "experiment_config": asdict(config),
+        "model_config": asdict(lm_config),
         "train_losses": train_losses,
         "val_losses": val_losses,
         "train_perplexities": train_perplexities,
@@ -200,24 +206,29 @@ def save_result_to_json(result, output_dir, run_id=None):
 
 
 def print_summary_table(results):
-    print("\n" + "=" * 80)
-    print("TRAINING SUMMARY")
-    print("=" * 80)
-    print(f"{'Model':<45} {'Layers':<8} {'Params (M)':<12} {'Val PPL':<10}")
-    print("-" * 80)
+    width = 80
+    print(
+        f"{'=' * width}\n"
+        f"TRAINING SUMMARY\n"
+        f"{'=' * width}\n"
+        f"{'Model':<45} {'Layers':<8} {'Params (M)':<12} {'Val PPL':<10}\n"
+        f"{'-' * width}"
+    )
 
     for result in results:
-        config = result["config"]
+        config = result["experiment_config"]
         num_params = result["num_params"] / 1e6
         val_ppl = result["best_val_ppl"]
 
-        model_name = f"TransformerLM (block size {config['max_context_len']})"
+        strategy = config["tensor_lifting_strategy"]
+        model_type = "GrassmannLM" if strategy == "grassmann" else "TransformerLM"
+        model_name = f"{model_type} (block size {config['max_context_len']})"
 
         print(
             f"{model_name:<45} {config['num_layers']:<8} {num_params:<12.2f} {val_ppl:<10.2f}"
         )
 
-    print("=" * 80)
+    print("=" * width)
 
 
 def parse_args():
@@ -229,12 +240,21 @@ def parse_args():
     parser.add_argument(
         "--num-layers", type=int, required=True, help="Number of transformer layers"
     )
-    parser.add_argument("--d-model", type=int, required=True, help="Model dimension")
+    parser.add_argument(
+        "--d-model", type=int, required=False, default=256, help="Model dimension"
+    )
     parser.add_argument(
         "--max-context-len", type=int, required=True, help="Maximum context length"
     )
     parser.add_argument("--batch-size", type=int, required=True, help="Batch size")
 
+    parser.add_argument(
+        "--tensor-lifting-strategy",
+        type=str,
+        default="attention",
+        choices=["attention", "grassmann"],
+        help="Tensor lifting strategy: 'attention' or 'grassmann' (default: attention)",
+    )
     parser.add_argument(
         "--num-heads",
         type=int,
@@ -242,7 +262,7 @@ def parse_args():
         help="Number of attention heads (default: 4)",
     )
     parser.add_argument(
-        "--dropout-rate", type=float, default=0.1, help="Dropout rate (default: 0.1)"
+        "--dropout-rate", type=float, default=0.1, help="Dropout rate (default: 0.0)"
     )
     parser.add_argument(
         "--num-epochs",
@@ -254,7 +274,25 @@ def parse_args():
         "--learning-rate",
         type=float,
         default=1e-3,
-        help="Learning rate (default: 1e-3)",
+        help="Learning rate (default: 3e-4)",
+    )
+    parser.add_argument(
+        "--d-low",
+        type=int,
+        default=32,
+        help="Dimension of reduced Grassmann space (default: 32)",
+    )
+    parser.add_argument(
+        "--lags",
+        type=int,
+        nargs="+",
+        default=[1, 2, 4, 8, 12, 16],
+        help="Causal lags for Grassmann mixing (default: 1 2 4 8 12 16)",
+    )
+    parser.add_argument(
+        "--pre-norm",
+        action="store_true",
+        help="Use pre-norm Transformer blocks (LayerNorm before attention/FFN). Default is post-norm.",
     )
 
     parser.add_argument(
@@ -280,10 +318,14 @@ def config_from_args(args):
         d_model=args.d_model,
         max_context_len=args.max_context_len,
         batch_size=args.batch_size,
+        tensor_lifting_strategy=args.tensor_lifting_strategy,
         num_heads=args.num_heads,
         dropout_rate=args.dropout_rate,
         num_epochs=args.num_epochs,
         learning_rate=args.learning_rate,
+        d_low=args.d_low,
+        lags=args.lags,
+        pre_norm=args.pre_norm,
     )
 
 
@@ -292,12 +334,10 @@ def main():
     experiment = config_from_args(args)
 
     result = train_model(experiment)
-
     output_dir = Path(args.output_dir)
     save_path = save_result_to_json(result, output_dir, args.run_id)
 
     print_summary_table([result])
-
     print(f"\nResults saved to: {save_path.absolute()}")
 
 
